@@ -156,57 +156,76 @@ class Dispatcher:
 
     async def stop(self):
         if not self.client.no_updates:
-            for i in range(self.client.workers):
+            tasks = list(self.handler_worker_tasks)
+
+            for _ in tasks:
                 self.updates_queue.put_nowait(None)
 
-            for i in self.handler_worker_tasks:
-                await i
+            # FIX: dulu `await i` tanpa batas waktu -> kalau satu worker lagi
+            # nyangkut di handler panjang (ask/listen, gcast, dll) stop() ikut
+            # hang selamanya dan client tidak bisa di-restart.
+            if tasks:
+                _, pending = await asyncio.wait(tasks, timeout=10)
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+            # FIX: buang sisa sentinel None (kalau ada worker yang di-cancel
+            # sebelum sempat mengambilnya), kalau tidak worker generasi
+            # berikutnya langsung mati begitu start() lagi.
+            while not self.updates_queue.empty():
+                try:
+                    self.updates_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
 
             self.handler_worker_tasks.clear()
-            self.groups.clear()
-            self.error_handlers.clear()
+            # FIX: dulu locks_list tidak pernah dikosongkan -> tiap stop/start
+            # (reconnect watchdog) nambah `workers` lock yang sudah mati.
+            self.locks_list.clear()
+            self.groups = OrderedDict()
+            self.error_handlers = []
 
             log.info("Stopped %s HandlerTasks", self.client.workers)
 
+    # FIX: versi lama add_handler() menjadwalkan task yang meng-acquire SEMUA
+    # lock worker satu per satu. Selama ada handler panjang yang sedang jalan
+    # (lock-nya dipegang), task itu menunggu, dan worker lain yang lock-nya
+    # sudah diambil tidak bisa memproses update -> client "diam" sampai handler
+    # panjang itu selesai. remove_handler() versi lama malah tidak pernah
+    # menjadwalkan fn() sama sekali (no-op).
+    # Sekarang copy-on-write: list/dict yang sedang di-iterasi dispatcher tidak
+    # pernah dimutasi, jadi aman tanpa lock dan efeknya langsung (sinkron).
     def add_handler(self, handler, group: int):
-        async def fn():
-            for lock in self.locks_list:
-                await lock.acquire()
+        if isinstance(handler, ErrorHandler):
+            if handler not in self.error_handlers:
+                self.error_handlers = [*self.error_handlers, handler]
+            return
 
-            try:
-                if isinstance(handler, ErrorHandler):
-                    if handler not in self.error_handlers:
-                        self.error_handlers.append(handler)
-                else:
-                    if group not in self.groups:
-                        self.groups[group] = []
-                        self.groups = OrderedDict(sorted(self.groups.items()))
-                    self.groups[group].append(handler)
-            finally:
-                for lock in self.locks_list:
-                    lock.release()
-
-        self.loop.create_task(fn())
+        groups = OrderedDict(self.groups)
+        groups[group] = [*groups.get(group, ()), handler]
+        self.groups = OrderedDict(sorted(groups.items(), key=lambda kv: kv[0]))
 
     def remove_handler(self, handler, group: int):
-        async def fn():
-            for lock in self.locks_list:
-                await lock.acquire()
+        if isinstance(handler, ErrorHandler):
+            if handler not in self.error_handlers:
+                raise ValueError(
+                    f"Error handler {handler} does not exist. Handler was not removed."
+                )
+            handlers = list(self.error_handlers)
+            handlers.remove(handler)
+            self.error_handlers = handlers
+            return
 
-            try:
-                if isinstance(handler, ErrorHandler):
-                    if handler not in self.error_handlers:
-                        raise ValueError(
-                            f"Error handler {handler} does not exist. Handler was not removed."
-                        )
-                    self.error_handlers.remove(handler)
-                else:
-                    if group not in self.groups:
-                        raise ValueError(f"Group {group} does not exist. Handler was not removed.")
-                    self.groups[group].remove(handler)
-            finally:
-                for lock in self.locks_list:
-                    lock.release()
+        if group not in self.groups:
+            raise ValueError(f"Group {group} does not exist. Handler was not removed.")
+
+        handlers = list(self.groups[group])
+        handlers.remove(handler)  # ValueError kalau memang tidak ada
+        groups = OrderedDict(self.groups)
+        groups[group] = handlers
+        self.groups = groups
 
     async def handler_worker(self, lock: asyncio.Lock):
         while True:
@@ -239,9 +258,7 @@ class Dispatcher:
         except Exception as e:
             log.exception(e)
             return
-        async with lock:
-            await self._dispatch_to_handlers(update, users, chats, parsed_update, handler_type)
-
+        await self._dispatch_to_handlers(update, users, chats, parsed_update, handler_type)
 
     async def _dispatch_to_handlers(
         self, update, users, chats, parsed_update, handler_type,
